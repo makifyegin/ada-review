@@ -1,8 +1,12 @@
+require('dotenv').config({override: true})
+const { sequelize } = require("./models/database")
 const express = require("express")
-
 const ada = express()
-
 const port = 3000
+
+sequelize.authenticate()
+    .then(()=>{console.log("Database connected")})
+    .catch((err)=>{console.error("Database connection failed:", err)})
 
 
 ada.get('/', (req, res) =>{
