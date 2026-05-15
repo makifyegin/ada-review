@@ -11,10 +11,18 @@ const createStudents = async (req, res) => {
   const createdIds = []
   const errors = []
   const transaction = await sequelize.transaction()
+
   try {
     for (const student of newStudents) {
       try {
+        const duplicatedUsername =
+          req.body.filter((s) => s.username === student.username).length > 1
+        if (duplicatedUsername) {
+          errors.push(`Duplicate username in batch: ${student.username}`)
+          continue // skip the create attempt for this row
+        }
         await sequelize.query('SAVEPOINT saved', { transaction })
+
         const created = await Student.create(
           {
             schoolId: req.params.schoolId,
