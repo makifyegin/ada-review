@@ -1,8 +1,7 @@
 require('dotenv').config({override: true})
 const { sequelize } = require("./models/database")
 const express = require("express")
-require('./models/school')
-require('./models/student')
+require('./models')
 const ada = express()
 const port = 3000
 

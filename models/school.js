@@ -9,15 +9,7 @@ const School = sequelize.define("School",
             validate:{
                 notEmpty: true
             }
-        },
-        postCode: {
-            type: DataTypes.STRING,
-            allowNull: false,
-            validate: {
-                notEmpty: true
-            }
-        },
-        testBoolean: DataTypes.BOOLEAN
+        }
 
     }
 )

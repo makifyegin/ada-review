@@ -33,27 +33,7 @@ const columns = {
 }
 }
 
-console.log("COLUMNS BEFORE DEFINE:", Object.keys(columns))
 
 const Student = sequelize.define("Student", columns)
-
-console.log("COLUMNS AFTER DEFINE:", Object.keys(Student.rawAttributes))
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 module.exports = Student
