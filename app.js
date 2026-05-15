@@ -1,12 +1,18 @@
 require('dotenv').config({override: true})
 const { sequelize } = require("./models/database")
 const express = require("express")
+require('./models/school')
+require('./models/student')
 const ada = express()
 const port = 3000
 
 sequelize.authenticate()
     .then(()=>{console.log("Database connected")})
     .catch((err)=>{console.error("Database connection failed:", err)})
+
+sequelize.sync({force: true})
+    .then(()=>{console.log("Model Synced")})
+    .catch((err)=>{console.error("Sync failed:", err)})
 
 
 ada.get('/', (req, res) =>{
