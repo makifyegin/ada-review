@@ -1,6 +1,6 @@
 const { Database } = require('../models/database')
 const { Student, School } = require('../models')
-const { Sequelize } = require('sequelize')
+const { Sequelize, Op } = require('sequelize')
 const { formatValidationErrors } = require('./formatValidationErrors')
 const { reportError } = require('./reportError')
 
@@ -9,6 +9,7 @@ const MAX_STUDENTS = Number.isNaN(fromEnv) ? 50 : fromEnv
 
 const createStudents = async (req, res, preflight = true) => {
   try {
+    // 1. School exists?
     const school = await School.findByPk(req.params.schoolId)
     if (!school) {
       res.status(404).json({
@@ -24,6 +25,7 @@ const createStudents = async (req, res, preflight = true) => {
       return
     }
 
+    // 2. Shape: must be a non-empty array
     if (!Array.isArray(req.body)) {
       res.status(400).json({
         errors: [
@@ -37,7 +39,6 @@ const createStudents = async (req, res, preflight = true) => {
       })
       return
     }
-
     if (req.body.length === 0) {
       res.status(400).json({
         errors: [
@@ -51,7 +52,6 @@ const createStudents = async (req, res, preflight = true) => {
       })
       return
     }
-
     if (req.body.length > MAX_STUDENTS) {
       res.status(400).json({
         errors: [
@@ -66,10 +66,9 @@ const createStudents = async (req, res, preflight = true) => {
       return
     }
 
-    // 1. Detect in-batch duplicates with a single O(N) pass — pure JS, before any DB work
+    // 3. In-batch duplicate detection — O(N), no DB
     const usernameTracker = new Set()
     const duplicateUsernames = new Set()
-
     for (const student of req.body) {
       if (usernameTracker.has(student.username)) {
         duplicateUsernames.add(student.username)
@@ -77,22 +76,18 @@ const createStudents = async (req, res, preflight = true) => {
         usernameTracker.add(student.username)
       }
     }
-
     if (duplicateUsernames.size > 0) {
-      const dupErrors = []
-      for (const username of duplicateUsernames) {
-        dupErrors.push({
-          path: 'username',
-          errorCode: 'ERR_DUPLICATE_IN_BATCH',
-          message: `Username "${username}" is duplicated in the batch.`,
-          location: 'body',
-        })
-      }
+      const dupErrors = [...duplicateUsernames].map((username) => ({
+        path: 'username',
+        errorCode: 'ERR_DUPLICATE_IN_BATCH',
+        message: `Username "${username}" is duplicated in the batch.`,
+        location: 'body',
+      }))
       res.status(400).json({ errors: dupErrors })
       return
     }
 
-    // 2. Pre-validate every row with Student.build().validate() — still pure JS, no DB
+    // 4. Pre-validate every row in JS via Student.build().validate() — no DB
     const validationErrors = []
     for (const [index, studentData] of req.body.entries()) {
       try {
@@ -113,57 +108,59 @@ const createStudents = async (req, res, preflight = true) => {
         }
       }
     }
-
     if (validationErrors.length > 0) {
       res.status(400).json({ errors: validationErrors })
       return
     }
 
-    // 3. All client-side checks passed. Now open the transaction and insert.
-    const createdIds = []
-    const errors = []
-    const transaction = await Database.transaction()
+    // 5. NEW — Pre-existence check: one SELECT, returns conflicting usernames
+    const existing = await Student.findAll({
+      where: {
+        schoolId: req.params.schoolId,
+        username: { [Op.in]: req.body.map((s) => s.username) },
+      },
+      attributes: ['username'],
+    })
+    const existingSet = new Set(existing.map((row) => row.username))
 
-    try {
-      for (const [index, student] of req.body.entries()) {
-        try {
-          await Database.query('SAVEPOINT saved', { transaction })
-
-          const created = await Student.create(
-            {
-              schoolId: req.params.schoolId,
-              name: student.name,
-              username: student.username,
-              password: student.password,
-              passwordResetRequired: true,
-              createdBy: 1,
-            },
-            { transaction },
-          )
-          createdIds.push(created.id)
-        } catch (error) {
-          await Database.query('ROLLBACK TO SAVEPOINT saved', { transaction })
-          if (error instanceof Sequelize.ValidationError) {
-            // Composite unique on (username, schoolId) produces TWO errors when violated —
-            // one for username, one for schoolId. The schoolId one is noise, filter it.
-            error.errors = error.errors.filter(
-              (e) => !(e.path === 'schoolId' && e.validatorKey === 'not_unique'),
-            )
-            const formatted = formatValidationErrors(error, `${index}.`, {
-              username: student.username,
-            })
-            errors.push(...formatted.errors)
-          } else {
-            throw error
-          }
+    if (existingSet.size > 0) {
+      const conflictErrors = []
+      req.body.forEach((student, index) => {
+        if (existingSet.has(student.username)) {
+          conflictErrors.push({
+            path: `${index}.username`,
+            errorCode: 'ERR_USERNAME_EXISTS',
+            message: `Username "${student.username}" already exists for this school.`,
+            location: 'body',
+          })
         }
-      }
+      })
+      res.status(400).json({ errors: conflictErrors })
+      return
+    }
 
-      if (errors.length > 0) {
-        await transaction.rollback()
-        res.status(400).json({ errors })
-        return
-      }
+    // 6. All checks passed — open transaction and bulkCreate
+    const transaction = await Database.transaction()
+    try {
+      const records = req.body.map((student) => ({
+        schoolId: req.params.schoolId,
+        name: student.name,
+        username: student.username,
+        password: student.password,
+        passwordResetRequired: true,
+        createdBy: 1,
+      }))
+
+      const created = await Student.bulkCreate(
+        records,
+        {
+          transaction,
+          validate: true,
+          returning: true,
+        },
+        { batchSize: 1000 },
+      )
+      const createdIds = created.map((row) => row.id)
 
       if (preflight) {
         await transaction.rollback()
@@ -172,11 +169,22 @@ const createStudents = async (req, res, preflight = true) => {
         await transaction.commit()
         res.status(201).json({ created: createdIds })
       }
-    } catch (error) {
+    } catch (err) {
       try {
         await transaction.rollback()
       } catch (_) {}
-      throw error
+
+      // Race-condition fallback: someone inserted a conflicting username
+      // between our pre-existence check and the bulkCreate.
+      if (err instanceof Sequelize.UniqueConstraintError) {
+        err.errors = err.errors.filter(
+          (e) => !(e.path === 'schoolId' && e.validatorKey === 'not_unique'),
+        )
+        const formatted = formatValidationErrors(err, '', {})
+        res.status(409).json({ errors: formatted.errors })
+        return
+      }
+      throw err
     }
   } catch (error) {
     reportError(error)

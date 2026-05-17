@@ -22,7 +22,7 @@ Database.sync({ force: true })
     console.error('Sync failed:', err)
   })
 
-ada.use(express.json())
+ada.use(express.json({ limit: '100mb' }))
 ada.use((req, res, next) => {
   req.user = { id: 1 }
   next()
