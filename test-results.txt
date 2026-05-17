@@ -1,0 +1,166 @@
+◇ injected env (6) from .env // tip: ⌘ override existing { override: true }
+Using schoolId: 1
+
+
+=== Test 1: school does not exist ===
+Status: 404
+Body: {
+  "errors": [
+    {
+      "path": "schoolId",
+      "errorCode": "ERR_SCHOOL_NOT_FOUND",
+      "message": "School not found.",
+      "location": "path"
+    }
+  ]
+}
+
+=== Test 2: empty batch ===
+Status: 400
+Body: {
+  "errors": [
+    {
+      "path": ".",
+      "errorCode": "ERR_EMPTY_BATCH",
+      "message": "Request body must contain at least one student.",
+      "location": "body"
+    }
+  ]
+}
+
+=== Test 3: batch too large (60 > MAX_STUDENTS) ===
+Status: 400
+Body: {
+  "errors": [
+    {
+      "path": ".",
+      "errorCode": "ERR_TOO_MANY_STUDENTS",
+      "message": "Cannot create more than 20 students in one request.",
+      "location": "body"
+    }
+  ]
+}
+
+=== Test 4: duplicate usernames in same batch ===
+Status: 400
+Body: {
+  "errors": [
+    {
+      "path": "username",
+      "errorCode": "ERR_DUPLICATE_IN_BATCH",
+      "message": "Username \"akif\" is duplicated in the batch.",
+      "location": "body"
+    }
+  ]
+}
+
+=== Test 5: empty name field ===
+Status: 400
+Body: {
+  "errors": [
+    {
+      "path": "0.name",
+      "errorCode": "notEmpty",
+      "message": "Validation notEmpty on name failed",
+      "location": "body",
+      "context": {
+        "username": "b1"
+      }
+    }
+  ]
+}
+
+=== Test 6: missing password ===
+Status: 400
+Body: {
+  "errors": [
+    {
+      "path": "0.password",
+      "errorCode": "is_null",
+      "message": "Student.password cannot be null",
+      "location": "body",
+      "context": {
+        "username": "d1"
+      }
+    }
+  ]
+}
+
+=== Test 7: multiple field errors ===
+Status: 400
+Body: {
+  "errors": [
+    {
+      "path": "0.name",
+      "errorCode": "notEmpty",
+      "message": "Validation notEmpty on name failed",
+      "location": "body",
+      "context": {
+        "username": ""
+      }
+    },
+    {
+      "path": "0.username",
+      "errorCode": "notEmpty",
+      "message": "Validation notEmpty on username failed",
+      "location": "body",
+      "context": {
+        "username": ""
+      }
+    },
+    {
+      "path": "0.password",
+      "errorCode": "notEmpty",
+      "message": "Validation notEmpty on password failed",
+      "location": "body",
+      "context": {
+        "username": ""
+      }
+    },
+    {
+      "path": "1.name",
+      "errorCode": "notEmpty",
+      "message": "Validation notEmpty on name failed",
+      "location": "body",
+      "context": {
+        "username": "e1"
+      }
+    }
+  ]
+}
+
+=== Test 8: preflight (valid data) — should NOT persist ===
+Status: 200
+Body: {
+  "verified": [
+    1,
+    2
+  ]
+}
+
+=== Test 9: real save after preflight ===
+Status: 201
+Body: {
+  "created": [
+    3,
+    4
+  ]
+}
+
+=== Test 10: duplicate against existing DB row (concurrency-style) ===
+Status: 400
+Body: {
+  "errors": [
+    {
+      "path": "0.username",
+      "errorCode": "not_unique",
+      "message": "username must be unique",
+      "location": "body",
+      "context": {
+        "username": "f1"
+      }
+    }
+  ]
+}
+
+=== Test run complete ===

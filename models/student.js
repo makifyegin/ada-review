@@ -1,5 +1,5 @@
-const { sequelize } = require('./database')
-const { DataTypes, UniqueConstraintError } = require('sequelize')
+const { Database } = require('./database')
+const { DataTypes } = require('sequelize')
 
 const columns = {
   name: {
@@ -33,8 +33,15 @@ const columns = {
   },
 }
 
-const Student = sequelize.define('Student', columns, {
+const Student = Database.define('Student', columns, {
   indexes: [{ unique: true, fields: ['username', 'schoolId'] }],
+  hooks: {
+    beforeCreate: (student, options) => {
+      if (options.discardPassword) {
+        student.password = '[discarded]'
+      }
+    },
+  },
 })
 
 module.exports = Student

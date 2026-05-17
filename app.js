@@ -1,13 +1,12 @@
 require('dotenv').config({ override: true })
 const { Student, School } = require('./models')
 const { createStudents } = require('./controllers/createStudents')
-const { sequelize } = require('./models/database')
+const { Database } = require('./models/database')
 const express = require('express')
 const ada = express()
 const port = 3000
 
-sequelize
-  .authenticate()
+Database.authenticate()
   .then(() => {
     console.log('Database connected')
   })
@@ -15,8 +14,7 @@ sequelize
     console.error('Database connection failed:', err)
   })
 
-sequelize
-  .sync({ force: true })
+Database.sync({ force: true })
   .then(() => {
     console.log('Model Synced')
   })
@@ -25,6 +23,10 @@ sequelize
   })
 
 ada.use(express.json())
+ada.use((req, res, next) => {
+  req.user = { id: 1 }
+  next()
+})
 ada.get('/', async (req, res) => {
   res.send('Hello World')
 })
@@ -35,6 +37,7 @@ ada.get('/schools/:schoolId/students', async (req, res) => {
 })
 
 ada.get('/schools', async (req, res) => {
+  console.log('req.user.id is:', req.user.id)
   const schools = await School.findAll()
   res.send({ schools: schools })
 })
@@ -52,7 +55,10 @@ ada.post('/school', async (req, res) => {
   res.status(201).json({ created: created })
 })
 
-ada.post('/schools/:schoolId/students', createStudents)
+ada.post('/schools/:schoolId/students', (req, res) => {
+  const isPreflight = req.query.preflight === 'true'
+  return createStudents(req, res, isPreflight)
+})
 
 ada.listen(port, () => {
   console.log(`Example app listening on port ${port}`)
