@@ -217,34 +217,26 @@ Shape validation should run before any other check. It's the absolute first thin
 
 **Analyse**
 
-The current implementation processes students in a loop, calling `Student.create` once per row inside a transaction. For each student: one `SAVEPOINT` query, one `INSERT` query, one round trip to Postgres. Plus the transaction open, commit, and per-row validation work.
+The original implementation processes students in a loop, calling `Student.create` once per row inside a transaction. For each student: one `SAVEPOINT` query, one `INSERT` query, one round trip to Postgres. Plus the transaction open, commit, and per-row validation work — all happening serially while the transaction holds locks.
 
 **Problems**
 
 This pattern is **O(N) database round trips**, all serial, all inside one open transaction.
 
-| Batch size | Loop pattern (est.) | Bulk pattern (est.) |
-| ---------- | ------------------- | ------------------- |
-| 100        | ~200ms              | ~30ms               |
-| 1,000      | ~2s                 | ~80ms               |
-| 10,000     | ~20s                | ~500ms              |
-
 At scale, three real problems compound:
 
-- **Latency** — 10,000 round trips dominate the response time
+- **Latency** — N round trips dominate response time
 - **Lock contention** — the transaction holds for the duration, blocking other writes to the table
 - **Timeouts** — at 30+ seconds, the HTTP layer times out and the user sees a failure even though work is happening
 
-The loop pattern only makes sense when you genuinely need per-row error reporting and can't pre-validate.
+The loop pattern only makes sense when per-row error reporting is genuinely needed AND pre-validation isn't possible.
 
 **Improvements**
 
-Use `Student.bulkCreate(records, { transaction, validate: true })` — one SQL statement, one round trip. The trade-off is that bulkCreate fails atomically: a single constraint violation fails the whole batch and Sequelize can't tell you which row caused it.
+I implemented the proposed alternative in this codebase to verify it works end to end:
 
-The hybrid pattern keeps both benefits:
-
-1. Pre-validate every row in JS via `Student.build(data).validate()` (already in this codebase) — catches field errors with row indices, no DB.
-2. Pre-check DB-level uniqueness with ONE query before the insert:
+1. **Pre-validate every row in JS** via `Student.build(data).validate()` — catches field errors with row indices, no DB.
+2. **Pre-check DB-level uniqueness in one query**:
 
 ```javascript
 const existing = await Student.findAll({
@@ -256,29 +248,53 @@ const existing = await Student.findAll({
 })
 ```
 
-Report conflicts with full row attribution.
+Errors are mapped back to row indices via a `Set` lookup, so the response keeps full per-row attribution.
 
-3. `bulkCreate` the remaining (now known-clean) rows in one round trip.
+3. **`bulkCreate` the remaining rows** in one round trip:
 
-**Three DB round trips total, regardless of batch size:** pre-check, bulk insert, commit.
+```javascript
+await Student.bulkCreate(records, { transaction, validate: true, returning: true })
+```
 
-Race condition: between pre-check and bulkCreate another request could insert a conflicting username. Wrap bulkCreate in a try/catch — on `UniqueConstraintError`, identify the conflict and respond per-row. Rare in practice; the pre-check handles the vast majority of cases.
+**Three DB round trips total, regardless of batch size:** pre-existence SELECT, bulk INSERT, COMMIT.
+
+**Race condition:** between the pre-check and `bulkCreate`, another request could insert a conflicting username. The hybrid wraps `bulkCreate` in a try/catch — on `UniqueConstraintError`, the conflicting row is identified and a 409 is returned with the same structured error shape.
+
+**Measured results**
+
+I generated synthetic batches and measured against a local Postgres in Docker:
+
+| Batch size                     | Result             | Observation                                                                                                                     |
+| ------------------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| 10,000 students (clean)        | **201 in 782ms**   | One pre-check SELECT, one bulkCreate INSERT, one COMMIT                                                                         |
+| 10,000 students (all conflict) | **400 in 231ms**   | Pre-check returned all 10k conflicts with row indices; no transaction opened                                                    |
+| 85,000 students                | **Single INSERT**  | Verified in SQL log: one `INSERT INTO Students ... VALUES (...) RETURNING ...` with 85k rows                                    |
+| 1,000,000 students             | **Server crashed** | `FATAL ERROR: Reached heap limit / Allocation failed - JavaScript heap out of memory` — Node process exhausted heap, full crash |
+
+The 85k receipt is interesting in its own right — I expected to hit Postgres's parameter limit (~65,535 per query) earlier, but empirically Sequelize and Postgres handled the single VALUES list without chunking.
 
 **Beyond the hybrid pattern — production architecture**
 
-For genuine 10,000+ imports, the synchronous request pattern itself is the bottleneck — not just the loop. Production member-import features (Ghost, Mailchimp, Stripe) typically use:
+The 1M test surfaced the _real_ failure mode of the synchronous request pattern: not a slow response, but **the Node process running out of memory and crashing**. Every in-flight request on the same process dies with it. This isn't something more tuning can fix — the request-response pattern itself is wrong for genuinely large imports.
 
-- **Async job processing** — HTTP request validates and queues, a background worker handles inserts in chunks
-- **Chunked transactions** — batches of 500 commit independently rather than one giant transaction
-- **Downloadable error reports** — failed rows logged for user review, successful rows saved
-- **Idempotency keys** — protect against duplicate submissions on retry
-- **Progress feedback** — websocket or polling for "1,250/10,000 imported"
+For production at scale, the standard answer is **async job processing**:
 
-This is a significant architecture change rather than a refactor of `createStudents.js`. Worth flagging as the long-term direction if bulk import becomes a real use case.
+- The HTTP endpoint validates the request, places the work in a queue (BullMQ on Redis, or pg-boss on Postgres), and returns immediately with a job ID
+- A separate worker process consumes the queue, processes rows in chunks of 500–1,000 in independent transactions, and tracks progress
+- The frontend polls or subscribes via websocket for status; failed rows are downloadable as a CSV
+- Job IDs serve as idempotency keys for retry safety
+
+This is the pattern Stripe, Mailchimp, and Ghost use for bulk import. It scales independently of HTTP timeouts, degrades gracefully under partial failure, and doesn't risk the API server's stability.
+
+A simpler **intermediate step**, before full async, is **client-side chunking** — the frontend splits a 10,000-row upload into 5 batches of 2,000 and sends each as a separate API call. Server stays under default body limits; each batch is atomic within its own transaction. The trade-off is loss of cross-batch atomicity — if batch 3 of 5 fails, batches 1–2 are already committed. For school admin workflows where the user can re-upload failed rows, this is usually acceptable.
+
+**Operational note — body parser limit**
+
+Default Express body parser rejects payloads over 100KB with a `413 Payload Too Large` HTML response (not JSON, which breaks the API's consistent error shape). Raising the limit is **not a real fix for huge imports** — it just postpones the failure mode from the HTTP layer to memory exhaustion in the handler. The correct response to "we need to import 100,000 rows" is the async job pattern, not a bigger body limit.
 
 **Feedback**
 
-The savepoint-per-row pattern is over-engineered for current scale and under-engineered for future scale. It buys per-row error attribution at the cost of N round trips. For the brief's "100s to 10,000s of students" target, the hybrid pattern is significantly better — same error attribution, dramatically better latency, fewer locks held. Beyond 10,000, the architecture itself needs rethinking.
+The savepoint-per-row pattern in the original is over-engineered for current scale and under-engineered for future scale. It buys per-row error attribution at the cost of N round trips. The hybrid pattern (pre-validation + pre-existence check + bulkCreate) achieves the same error attribution with three round trips total, scaling comfortably to 10,000+ on this stack. Beyond that, the architecture itself needs rethinking — async job processing for truly large imports, or client-side chunking for a simpler intermediate solution.
 
 ### 6. Response shape inconsistency
 
