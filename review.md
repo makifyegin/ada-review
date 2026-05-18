@@ -273,6 +273,27 @@ I tested this against a local Postgres in Docker:
 
 The 85k result was a surprise — I expected to hit Postgres's parameter limit (~65,535) much earlier, but empirically Sequelize and Postgres handled it in one statement.
 
+**A safer next step — chunked bulkCreate**
+
+Sending all 10,000 rows in one `bulkCreate` worked in my testing, but production safety is better served by chunking the insert. Splitting the clean rows into batches of, say, 1,000 and looping `bulkCreate` over them keeps each INSERT small — well under any parameter or memory limit:
+
+```javascript
+const CHUNK_SIZE = 1000
+const transaction = await Database.transaction()
+try {
+  for (let i = 0; i < records.length; i += CHUNK_SIZE) {
+    const chunk = records.slice(i, i + CHUNK_SIZE)
+    await Student.bulkCreate(chunk, { transaction, validate: true, returning: true })
+  }
+  await transaction.commit()
+} catch (err) {
+  await transaction.rollback()
+  throw err
+}
+```
+
+The transaction still wraps the whole batch, so atomicity is preserved — every chunk commits, or none of them does. No savepoints needed: if any chunk throws, the catch block rolls everything back. The win is that no single INSERT carries the whole batch, which makes the failure mode more predictable.
+
 **Beyond the hybrid — async job processing**
 
 The 1M test exposed the real failure mode of the synchronous pattern. It isn't slow responses, it's the **Node process running out of memory and crashing**. Every in-flight request dies with it. No amount of tuning fixes that — the request/response pattern itself is wrong for genuinely large imports.
@@ -287,7 +308,7 @@ The default Express body parser rejects payloads over 100KB with a `413 Payload 
 
 **Feedback**
 
-The savepoint-per-row pattern is over-engineered for current scale and under-engineered for future scale. The hybrid (pre-validation + pre-existence check + bulkCreate) gives you the same per-row error attribution with three round trips total — comfortable up to ~10,000 students. Beyond that, the architecture itself needs to change: async job processing for genuinely large imports, or client-side chunking as a simpler intermediate.
+The savepoint-per-row pattern is over-engineered for current scale and under-engineered for future scale. The hybrid (pre-validation + pre-existence check + bulkCreate) gives you the same per-row error attribution with three round trips total — comfortable up to ~10,000 students. Chunked bulkCreate is the safer next step within the same request/response shape. Beyond that, the architecture itself needs to change: async job processing for genuinely large imports, or client-side chunking as a simpler intermediate.
 
 ### 6. Response shape inconsistency
 
