@@ -2,41 +2,39 @@
 
 ## Overview
 
-When I read `createStudents.js`, I imagined the real situation it has to handle. A teacher wants to upload her class — maybe an Excel file with thirty students, maybe hundreds or 10 thousands — into the system. Every student needs a unique username within that school. Before anything is saved, teacher wants to know whether the file is clean: are all the usernames unique, do all the fields validate? If there's a problem, she should see what's wrong and fix it. Only when the preflight check passes does the real save happen.
+When I read `createStudents.js`, I imagined the real situation it has to handle. A teacher wants to upload her class — maybe an Excel file with hundreds, maybe thousands of students — into the system. Every student needs a unique username within that school. Before anything is saved, the teacher wants to know whether the file is clean: are all the usernames unique, do all the fields validate? If there's a problem, she should see what's wrong and fix it. Only when the preflight check passes does the real save happen.
+
 The code does this. The author has clearly thought about it — atomic batches with transactions, per-row error collection with savepoints, a preflight mode that doesn't persist passwords during a dry run. The implementation works.
 
-What I found is mostly about scaling and structure, not correctness. The code works. But it does more work than it needs to, and it does it in the wrong order.
-The main theme running through my findings is this: many of the checks happen inside the database transaction when they could happen in JavaScript first. Duplicate usernames in the same batch, empty fields, missing required values — none of these need a database connection to detect. The original code opens a transaction, starts inserting, and only then notices the problem. That's expensive: it holds a connection from the pool, runs SQL queries, opens savepoints, rolls them back — all to discover something a single pass in JavaScript would have caught.
-
-The biggest structural issue is the per-row INSERT loop. For each student in the batch, the original code runs three SQL statements — a SAVEPOINT, the INSERT, and sometimes a ROLLBACK if validation fails. Each statement is a network round trip between Node and Postgres. For 10,000 students that's over 20,000 round trips. Even at a couple of milliseconds each, the network time alone dominates the response.
-The savepoint pattern itself is a thoughtful design choice — it lets the code collect every row's error in one pass instead of failing on the first bad row. The cost is that it ties every single check to a database round trip, including checks that JavaScript could handle on its own.
-The fix is to do as much as possible before touching the database. Pre-validate every row in JavaScript using Student.build().validate(). Check for existing usernames in a single SELECT with WHERE username IN (...). Then send one bulkCreate for all the known-clean rows. Three round trips total, regardless of batch size, instead of twenty thousand. I tested this end to end — 10,000 students in 782ms compared with an estimated 20 seconds for the loop.
+What I found is mostly about scaling and structure, not correctness. The code does more work than it needs to, and it does it in the wrong order — many of the checks happen inside the database transaction when they could happen in JavaScript first. Things like duplicate usernames in the same batch, empty fields, missing required values — none of these need a database connection to detect. The biggest example is the per-row INSERT loop — for 10,000 students it makes over 20,000 round trips to Postgres. Section 5 walks through this with measurements: my hybrid replacement (pre-validation in JavaScript + one SELECT for existing usernames + one bulkCreate) handles 10,000 students in 782ms instead of an estimated 20 seconds.
 
 For context: I built a parallel Express/Sequelize/Postgres project from scratch to hit the same problems this file solves, then iterated through several refactors of my own version. Verification of the suggestions in this review is captured in `script/batch-test.js` and `test-results.txt`.
 
 ## Strengths
 
-Several aspects of the implementation are worth highlighting up front:
+A few things in this code are genuinely well thought through, and I want to flag them before getting into the issues:
 
-- **Savepoint-based per-row error collection.** Using `SAVEPOINT` inside an open transaction to enumerate every row error in one pass — rather than aborting on first failure — is a thoughtful use of Postgres. It means the user gets back every error in a single response, not one at a time across multiple retries.
-- **`discardPassword: preflight` option.** Wiring a model-level option into preflight so the real password is never persisted during a dry-run is a subtle security win. Preflight may be called frequently from a UI; avoiding password exposure in transaction memory and DB logs reduces leakage risk on every call.
-- **Composite-unique noise filter.** Filtering the `schoolId / not_unique` error from the response when a composite unique index is violated is defensive code that recognises a real Sequelize quirk. Most developers would only notice this after testing against actual data — kudos for handling it.
-- **Clean preflight design.** Same code path for verified and created; only the final step differs (rollback vs commit). The pipeline runs in full both ways, so preflight produces a faithful prediction of what the real save would do.
-- **Separation of concerns.** Validators live on the model. Formatting is extracted to `formatValidationErrors`. Error reporting goes through `reportError`. The controller stays focused on control flow.
+- **Savepoint-based per-row error collection.** Using `SAVEPOINT` inside a transaction to collect every row's error in one pass — rather than failing on the first bad row — is a smart use of Postgres. The user gets every problem back in one response instead of fixing them one at a time across multiple retries.
+
+- **`discardPassword: preflight` option.** Wiring this into the model so passwords aren't persisted during a dry-run is a small but real security win. Preflight gets called often, and avoiding password exposure in transaction memory and DB logs on every call adds up.
+
+- **Composite-unique noise filter.** Filtering out the `schoolId / not_unique` error when a composite unique index is violated is defensive code that recognises a real Sequelize quirk. Most developers would only notice this after hitting it in testing.
+
+- **Clean preflight design.** Same code path for verified and created — only the final step differs (rollback vs commit). The whole pipeline runs both ways, so preflight gives you a faithful prediction of what the real save would do.
+
+- **Separation of concerns.** Validators on the model. Formatting in `formatValidationErrors`. Error reporting in `reportError`. The controller stays focused on control flow.
 
 ## Tools used
-
-This review and the supporting code were produced with the following tools:
 
 - **Editor and runtime:** VS Code, Node.js v22, Postgres 17 in Docker
 - **Libraries:** Express, Sequelize v6, dotenv
 - **DB inspection:** Beekeeper Studio
-- **AI assistance:** I used Claude (Anthropic) throughout this project as a pair-programmer and tutor. The work followed a deliberate pattern — I drafted an initial loop-with-savepoints implementation by hand, then worked through refactors one at a time: pre-validation using `Student.build().validate()`, in-batch duplicate detection with `Set`, consistent error formatting via the `formatValidationErrors` helper, and finally the hybrid bulkCreate pattern with a pre-existence check. After each refactor, I ran the batch test script and inspected the responses before moving on. The review prose was drafted in conversation with Claude — I pushed back where the wording felt borrowed, and rewrote sections in my own voice before including them. My broader approach to AI-assisted learning — what I expect from a tutor, what breaks my learning, and how I verify understanding rather than copy — is documented in [`LEARNING_STYLE.md`](./LEARNING_STYLE.md) in the repo root.
-- **Verification:** A batch test script (`script/batch-test.js`) exercises 10 distinct scenarios — school-not-found, empty batch, oversize batch, in-batch duplicates, field validation, pre-existence conflicts, preflight, real save, and others. Output captured in `test-results.txt`. For scaling claims in section 5, I ran additional load tests at 10,000, 85,000, and 1,000,000 students against my parallel implementation; the receipts (timings and failure modes) are cited inline in that section.
+- **AI assistance:** I used Claude (Anthropic) throughout this project as a pair-programmer and tutor. I drafted the initial loop-with-savepoints implementation by hand, then worked through refactors one at a time — verifying each one with the batch test script before moving on. The review prose was drafted in conversation with Claude and edited in my own voice. My broader approach to AI-assisted learning is documented in [`LEARNING_STYLE.md`](./LEARNING_STYLE.md).
+- **Verification:** A batch test script (`script/batch-test.js`) exercises 10 scenarios — school-not-found, empty batch, oversize batch, in-batch duplicates, field validation, pre-existence conflicts, preflight, real save, and others. Output is in `test-results.txt`. For scaling claims in section 5, I ran additional load tests at 10,000, 85,000, and 1,000,000 students against my parallel implementation; the timings and failure modes are cited in that section.
 
 ## Issues
 
-### 1. Configuration handling: `maxStudents`
+### 1. Configuration handling: maxStudents
 
 **Analyse**
 
@@ -44,34 +42,36 @@ This review and the supporting code were produced with the following tools:
 const maxStudents = process.env.MAX_STUDENTS_PER_REQUEST || 50
 ```
 
-Read inside the handler on every request.
+This is read inside the handler on every request.
 
 **Problems**
 
-- **Function scope.** Config never changes during the process lifetime — should be module scope.
-- **No type conversion.** `process.env` always returns strings. `maxStudents` is a string when the env is set, but a number when it falls back. Inconsistent.
-- **`||` brittle for the `0` killswitch.** Currently works by accident (because `"0"` is a truthy non-empty string). Switching to `parseInt + ||` would silently break the killswitch since `0` is falsy. Switching to `?? 50` doesn't help either — `NaN` from parsing invalid or missing input isn't nullish, so `??` keeps it, and the limit then breaks silently (`count > NaN` is always false).
+- **Function scope.** It's currently reading the environment variable inside the function. There's no reason to read it on every request — the env doesn't change while the process is running. It should be at module scope so it runs once when Node starts and lives in memory.
+
+- **String vs number.** Environment variables always return strings. We need to parse it to a number and check the result is valid. Otherwise the comparison with `req.body.length` later in the code can give the wrong result.
+
+- **The `|| 50` killswitch trap.** The killswitch behaviour itself is good practice — being able to disable a risky feature via config without a redeploy is exactly what you want in production. But the current implementation works by accident, because `"0"` is a non-empty string and therefore truthy. The first developer who tries to tidy the type handling — say, by writing `parseInt(...) || 50` — will silently break the killswitch, because `0 || 50` returns 50.
 
 **Improvements**
 
-Hoist to module scope, parse explicitly, guard against `NaN`:
+Move it to module scope, parse it explicitly, and guard against `NaN`:
 
 ```javascript
 const fromEnv = parseInt(process.env.MAX_STUDENTS_PER_REQUEST, 10)
 const MAX_STUDENTS = Number.isNaN(fromEnv) ? 50 : fromEnv
 ```
 
-Two lines, no operator tricks. Handles missing env, invalid input, and the `0` killswitch consistently. `MAX_STUDENTS` is always a number.
+Two lines, no operator tricks. Handles missing env, invalid input, and the `0` killswitch consistently — `MAX_STUDENTS` is always a number.
 
 **Feedback**
 
-`ALL_CAPS` for module constants. Remove the commented-out line.
+Use `ALL_CAPS` for module constants. The commented-out alternative in the original should be removed.
 
 ### 2. In-batch duplicate detection: O(N²) and inside the transaction
 
 **Analyse**
 
-For each student in the batch, the original checks for in-batch duplicates by filtering the entire request body:
+For each student in the batch, the original checks for duplicates by filtering the entire request body:
 
 ```javascript
 for (let [index, student] of req.body.entries()) {
@@ -80,16 +80,16 @@ for (let [index, student] of req.body.entries()) {
 }
 ```
 
-This check runs **inside the transaction**, after `Database.transaction()` has been opened.
+This check runs **inside the transaction**, after `Database.transaction()` has already been opened.
 
 **Problems**
 
-- **O(N²) complexity.** `filter()` walks the entire batch for every iteration of the outer loop. For 50 students, 2,500 comparisons. For 10,000 students, 100 million.
-- **Validation runs after the transaction is open.** If the batch has duplicates, the transaction has already been acquired and savepoints opened, all of which has to be rolled back. The duplicate check is pure JavaScript — it doesn't need a database connection.
+- **O(N²) complexity.** `filter()` walks the entire batch for every iteration of the outer loop. For 50 students that's 2,500 comparisons. For 10,000 students it's 100 million.
+- **Runs after the transaction is open.** If the batch has duplicates, a transaction has already been acquired and savepoints opened — all of which has to be rolled back. The duplicate check is pure JavaScript. It doesn't need a database connection at all.
 
 **Improvements**
 
-Detect duplicates with a single O(N) pass using a `Set`, before opening the transaction:
+Use a `Set` to detect duplicates in a single pass, before opening the transaction:
 
 ```javascript
 const usernameTracker = new Set()
@@ -104,21 +104,21 @@ for (const student of req.body) {
 }
 
 if (duplicateUsernames.size > 0) {
-  // build error array, respond 400, return — without opening any transaction
+  // build error array, respond 400, return — no transaction needed
 }
 ```
 
-Single pass. `Set.has()` and `Set.add()` are O(1). Fails fast when the batch is malformed.
+One pass. `Set.has()` and `Set.add()` are O(1). The function fails fast when the batch is malformed, and no database work happens for batches that were never going to succeed.
 
 **Feedback**
 
-Cheap pure-JS validation should happen before acquiring database resources. The original works correctly but scales badly. The fix has the additional benefit of simplifying the inner loop — the duplicate-check block is no longer needed inside the per-student try/catch.
+Cheap JavaScript validation should happen before acquiring database resources. The original works correctly but scales badly. The fix also simplifies the inner loop — the duplicate-check block disappears from the per-student try/catch.
 
 ### 3. Field-level validation runs inside the transaction
 
 **Analyse**
 
-The original calls `Student.create(...)` inside the per-row loop. Sequelize runs the model's column validators (`notEmpty`, type checks, `allowNull`) as part of `create`. If a row has an empty name or missing field, the savepoint rolls back and the error is recorded.
+The original calls `Student.create(...)` inside the per-row loop. Sequelize runs the model's column validators (`notEmpty`, type checks, `allowNull`) as part of `create`. If a row has an empty name or a missing field, the savepoint rolls back and the error is recorded.
 
 ```javascript
 await Database.query('SAVEPOINT saved', { transaction })
@@ -128,8 +128,8 @@ const createdStudent = await Student.create(rowData, { transaction })
 
 **Problems**
 
-- **Validation happens after the transaction is open.** A row with an empty name forces an open transaction, a savepoint, an attempted INSERT, and a rollback — none of which is needed to detect an empty string in JavaScript.
-- **Pure-JS errors share the same flow as DB-only errors.** Field-level checks (which only need JS) and concurrency-driven errors (which only the DB can know) are caught together, making the flow harder to reason about.
+- **Validation happens after the transaction is open.** A row with an empty name forces an open transaction, a savepoint, an INSERT attempt, and a rollback — none of which is needed to detect an empty string in JavaScript.
+- **Pure-JS errors share the same flow as DB-only errors.** Field-level checks (which only need JS) and concurrency-driven errors (which only the DB can know) get caught in the same place. That makes the flow harder to reason about.
 
 **Improvements**
 
@@ -161,31 +161,26 @@ if (validationErrors.length > 0) {
 // only now open the transaction
 ```
 
-`build()` creates an unsaved instance. `validate()` runs the same column validators `create()` would, without sending an INSERT. Errors are collected in JS, with row indices, before any DB resources are acquired.
+`build()` creates an unsaved instance. `validate()` runs the same column validators `create()` would, without sending an INSERT. Errors are collected in JavaScript, with row indices, before any DB resources are acquired.
 
 **Feedback**
 
-The pure-JS pre-validation pass catches everything _the model layer_ can catch (column validators, type checks, `allowNull`) before any DB work begins. What it **cannot** catch — and what must remain at the DB level — is:
-
-- Unique constraint violations across the whole table (race conditions: another request may insert the same username concurrently)
-- Foreign key violations (the school could be deleted between `findByPk` and the insert)
-
-So the savepoint-based catch inside the loop still has a role — but only for DB-only errors, not field-level validation. This separates JavaScript concerns (data shape) from database concerns (concurrent state) and avoids opening a transaction for batches that were never going to succeed.
+This separates JavaScript concerns (data shape) from database concerns (concurrent state). What pre-validation catches: column validators, type checks, `allowNull`. What it can't catch — and what still has to live at the DB level — is anything the database alone knows about: unique constraint violations from race conditions, foreign key violations if the school is deleted mid-request. So the savepoint pattern inside the loop still has a role, but only for those genuine DB-only errors.
 
 ### 4. No shape validation on `req.body`
 
 **Analyse**
 
-The original assumes `req.body` is an array of student objects with the right fields. There's no check that the body is actually an array, or that it contains anything.
+The original assumes `req.body` is an array of student objects. There's no check that it's actually an array, or that it contains anything.
 
 **Problems**
 
 - A client sending `null`, an object, or a string would crash the handler on `.length` or `.filter`.
-- An empty batch `[]` succeeds with no inserts but still opens a transaction (verified in testing).
+- An empty batch `[]` succeeds with no inserts, but still opens a transaction.
 
 **Improvements**
 
-Quick fix — manual checks at the top of the handler:
+A quick fix is two manual checks at the top of the handler:
 
 ```javascript
 if (!Array.isArray(req.body)) {
@@ -198,7 +193,7 @@ if (req.body.length === 0) {
 }
 ```
 
-Better — a schema validation library (Zod, Joi) lets you declare the expected shape declaratively and validates the whole body in one pass:
+A better fix is a schema library like Zod or Joi — you declare the expected shape once, and it validates the whole body in one pass:
 
 ```javascript
 const BodySchema = z
@@ -217,32 +212,31 @@ One source of truth for the API contract, with detailed errors for free.
 
 **Feedback**
 
-Shape validation should run before any other check. It's the absolute first thing — guards every line below it from assumptions about the body's structure.
+Shape validation should be the first thing the handler does. It guards every line below it from assumptions about the body's structure.
 
 ### 5. Scaling: per-row INSERTs vs bulk operations
 
 **Analyse**
 
-The original implementation processes students in a loop, calling `Student.create` once per row inside a transaction. For each student: one `SAVEPOINT` query, one `INSERT` query, one round trip to Postgres. Plus the transaction open, commit, and per-row validation work — all happening serially while the transaction holds locks.
+The original processes students in a loop, calling `Student.create` once per row inside a transaction. For each student that's three SQL statements — a `SAVEPOINT`, the `INSERT`, and sometimes a `ROLLBACK` if validation fails. All of it serial, all inside one open transaction.
 
 **Problems**
 
-This pattern is **O(N) database round trips**, all serial, all inside one open transaction.
+This is **O(N) database round trips**. Three things compound at scale:
 
-At scale, three real problems compound:
+- **Latency** — N round trips dominate the response time.
+- **Lock contention** — the transaction holds for the whole duration, blocking other writes to the table.
+- **Timeouts** — at 30+ seconds the HTTP layer times out, even though the work is still happening on the server.
 
-- **Latency** — N round trips dominate response time
-- **Lock contention** — the transaction holds for the duration, blocking other writes to the table
-- **Timeouts** — at 30+ seconds, the HTTP layer times out and the user sees a failure even though work is happening
-
-The loop pattern only makes sense when per-row error reporting is genuinely needed AND pre-validation isn't possible.
+The loop pattern only makes sense when per-row error reporting is genuinely needed _and_ pre-validation isn't possible.
 
 **Improvements**
 
-I implemented the proposed alternative in this codebase to verify it works end to end:
+I implemented and tested the alternative end to end:
 
-1. **Pre-validate every row in JS** via `Student.build(data).validate()` — catches field errors with row indices, no DB.
-2. **Pre-check DB-level uniqueness in one query**:
+1. **Pre-validate every row in JavaScript** with `Student.build(data).validate()` — catches field errors with row indices, no DB.
+
+2. **Pre-check existing usernames in one query:**
 
 ```javascript
 const existing = await Student.findAll({
@@ -254,59 +248,52 @@ const existing = await Student.findAll({
 })
 ```
 
-Errors are mapped back to row indices via a `Set` lookup, so the response keeps full per-row attribution.
+Conflicts are mapped back to row indices using a `Set`, so the error response still has full per-row attribution.
 
-3. **`bulkCreate` the remaining rows** in one round trip:
+3. **`bulkCreate` the clean rows** in one round trip:
 
 ```javascript
 await Student.bulkCreate(records, { transaction, validate: true, returning: true })
 ```
 
-**Three DB round trips total, regardless of batch size:** pre-existence SELECT, bulk INSERT, COMMIT.
+That's three round trips total, regardless of batch size: pre-existence SELECT, bulk INSERT, COMMIT.
 
-**Race condition:** between the pre-check and `bulkCreate`, another request could insert a conflicting username. The hybrid wraps `bulkCreate` in a try/catch — on `UniqueConstraintError`, the conflicting row is identified and a 409 is returned with the same structured error shape.
+A race is still possible — another request could insert a conflicting username between the pre-check and the bulk insert. The hybrid wraps `bulkCreate` in a try/catch and returns a 409 with the same error shape if `UniqueConstraintError` fires.
 
 **Measured results**
 
-I generated synthetic batches and measured against a local Postgres in Docker:
+I tested this against a local Postgres in Docker:
 
-| Batch size                     | Result             | Observation                                                                                                                     |
-| ------------------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
-| 10,000 students (clean)        | **201 in 782ms**   | One pre-check SELECT, one bulkCreate INSERT, one COMMIT                                                                         |
-| 10,000 students (all conflict) | **400 in 231ms**   | Pre-check returned all 10k conflicts with row indices; no transaction opened                                                    |
-| 85,000 students                | **Single INSERT**  | Verified in SQL log: one `INSERT INTO Students ... VALUES (...) RETURNING ...` with 85k rows                                    |
-| 1,000,000 students             | **Server crashed** | `FATAL ERROR: Reached heap limit / Allocation failed - JavaScript heap out of memory` — Node process exhausted heap, full crash |
+| Batch size                     | Result             | Notes                                                                              |
+| ------------------------------ | ------------------ | ---------------------------------------------------------------------------------- |
+| 10,000 students (clean)        | **201 in 782ms**   | One pre-check SELECT, one bulkCreate INSERT, one COMMIT                            |
+| 10,000 students (all conflict) | **400 in 231ms**   | Pre-check returned every conflict with row index; no transaction opened            |
+| 85,000 students                | **Single INSERT**  | One `INSERT ... VALUES (...) RETURNING ...` with 85k rows, verified in the SQL log |
+| 1,000,000 students             | **Server crashed** | `FATAL ERROR: Reached heap limit` — Node process ran out of memory                 |
 
-The 85k receipt is interesting in its own right — I expected to hit Postgres's parameter limit (~65,535 per query) earlier, but empirically Sequelize and Postgres handled the single VALUES list without chunking.
+The 85k result was a surprise — I expected to hit Postgres's parameter limit (~65,535) much earlier, but empirically Sequelize and Postgres handled it in one statement.
 
-**Beyond the hybrid pattern — production architecture**
+**Beyond the hybrid — async job processing**
 
-The 1M test surfaced the _real_ failure mode of the synchronous request pattern: not a slow response, but **the Node process running out of memory and crashing**. Every in-flight request on the same process dies with it. This isn't something more tuning can fix — the request-response pattern itself is wrong for genuinely large imports.
+The 1M test exposed the real failure mode of the synchronous pattern. It isn't slow responses, it's the **Node process running out of memory and crashing**. Every in-flight request dies with it. No amount of tuning fixes that — the request/response pattern itself is wrong for genuinely large imports.
 
-For production at scale, the standard answer is **async job processing**:
+For production scale, the answer is **async job processing**. The HTTP endpoint validates the request, puts it on a queue (BullMQ on Redis, or pg-boss on Postgres), and returns immediately with a job ID. A separate worker consumes the queue, processes chunks of 500–1,000 rows in independent transactions, and tracks progress. The frontend polls or subscribes via websocket; failed rows are downloadable as a CSV. This is the pattern Stripe, Mailchimp, and Ghost use.
 
-- The HTTP endpoint validates the request, places the work in a queue (BullMQ on Redis, or pg-boss on Postgres), and returns immediately with a job ID
-- A separate worker process consumes the queue, processes rows in chunks of 500–1,000 in independent transactions, and tracks progress
-- The frontend polls or subscribes via websocket for status; failed rows are downloadable as a CSV
-- Job IDs serve as idempotency keys for retry safety
+A simpler intermediate step is **client-side chunking** — the frontend splits a 10,000-row upload into 5 batches of 2,000. Server stays under default body limits and each batch is atomic. The trade-off is no cross-batch atomicity — if batch 3 of 5 fails, batches 1–2 are already committed. For a school admin workflow, where the user can just re-upload the failed rows, this is usually fine.
 
-This is the pattern Stripe, Mailchimp, and Ghost use for bulk import. It scales independently of HTTP timeouts, degrades gracefully under partial failure, and doesn't risk the API server's stability.
+**Body parser note**
 
-A simpler **intermediate step**, before full async, is **client-side chunking** — the frontend splits a 10,000-row upload into 5 batches of 2,000 and sends each as a separate API call. Server stays under default body limits; each batch is atomic within its own transaction. The trade-off is loss of cross-batch atomicity — if batch 3 of 5 fails, batches 1–2 are already committed. For school admin workflows where the user can re-upload failed rows, this is usually acceptable.
-
-**Operational note — body parser limit**
-
-Default Express body parser rejects payloads over 100KB with a `413 Payload Too Large` HTML response (not JSON, which breaks the API's consistent error shape). Raising the limit is **not a real fix for huge imports** — it just postpones the failure mode from the HTTP layer to memory exhaustion in the handler. The correct response to "we need to import 100,000 rows" is the async job pattern, not a bigger body limit.
+The default Express body parser rejects payloads over 100KB with a `413 Payload Too Large` HTML response (not JSON, which breaks the API's error shape). Raising the limit isn't a real fix — it just moves the failure from the HTTP layer to memory exhaustion in the handler. For genuinely large imports, the answer is the async job pattern, not a bigger body limit.
 
 **Feedback**
 
-The savepoint-per-row pattern in the original is over-engineered for current scale and under-engineered for future scale. It buys per-row error attribution at the cost of N round trips. The hybrid pattern (pre-validation + pre-existence check + bulkCreate) achieves the same error attribution with three round trips total, scaling comfortably to 10,000+ on this stack. Beyond that, the architecture itself needs rethinking — async job processing for truly large imports, or client-side chunking for a simpler intermediate solution.
+The savepoint-per-row pattern is over-engineered for current scale and under-engineered for future scale. The hybrid (pre-validation + pre-existence check + bulkCreate) gives you the same per-row error attribution with three round trips total — comfortable up to ~10,000 students. Beyond that, the architecture itself needs to change: async job processing for genuinely large imports, or client-side chunking as a simpler intermediate.
 
 ### 6. Response shape inconsistency
 
 **Analyse**
 
-The original returns errors in two different shapes depending on the failure mode:
+The original returns errors in two different shapes depending on the failure:
 
 - School-not-found and too-many-students return **a bare array**:
 
@@ -320,11 +307,11 @@ res.status(404).json([{ path: 'schoolId', errorCode: 'ERR_SCHOOL_NOT_FOUND', ...
 res.status(400).json({ errors: [...] })
 ```
 
-- Success responses use yet another shape — `{ verified: [...] }` or `{ created: [...] }`.
+Success responses use yet another shape: `{ verified: [...] }` or `{ created: [...] }`.
 
 **Problems**
 
-The frontend has to branch on the response shape to know how to parse errors. `response.errors` works for some failures, `response[0]` for others. Easy to get wrong, and surprising for consumers who expect a single error envelope across the API.
+The frontend has to branch on the response shape to know how to parse errors. `response.errors` works for some failures, `response[0]` for others. Easy to get wrong, and surprising for anyone expecting a single error envelope across the API.
 
 **Improvements**
 
@@ -334,17 +321,17 @@ Standardise on the object form for every error response:
 res.status(404).json({ errors: [{ path: 'schoolId', errorCode: 'ERR_SCHOOL_NOT_FOUND', ... }] })
 ```
 
-This way the frontend can write a single error-rendering routine that reads `response.errors`, regardless of which check fired. It also leaves room to add metadata later (a `meta` field for request IDs, pagination on the success side, etc) without breaking consumers.
+Now the frontend can write one error-rendering routine that reads `response.errors`, no matter which check fired. It also leaves room to add metadata later — a `meta` field for request IDs, pagination on the success side — without breaking consumers.
 
 **Feedback**
 
-API consistency is a force multiplier — it lets the frontend assume a uniform contract and means new endpoints don't need new parsing code. Worth fixing across the board.
+API consistency is a force multiplier. The frontend gets one contract to rely on, and new endpoints don't need new parsing code. Worth fixing across the board.
 
-### 7. Outer catch returns 400 with leaked `error.message`
+### 7. Outer catch returns 500 cleanly — but watch for the easy mistake
 
 **Analyse**
 
-The outer catch in the original returns 500 cleanly:
+The outer catch in the original is correct:
 
 ```javascript
 } catch (error) {
@@ -353,7 +340,7 @@ The outer catch in the original returns 500 cleanly:
 }
 ```
 
-That's correct — but worth holding up against the pattern that's _easy to slip into_ in similar handlers:
+I'm flagging it because the wrong version of this is easy to write, and worth calling out:
 
 ```javascript
 } catch (error) {
@@ -361,68 +348,71 @@ That's correct — but worth holding up against the pattern that's _easy to slip
 }
 ```
 
-**Problems**
+**Problems with the bad pattern**
 
-The bad pattern is bad for two reasons:
+- **Wrong status.** Unexpected errors in the outer catch are server bugs, not client mistakes. A 4xx tells the client "you did something wrong"; a 5xx tells them "the server broke." Status codes are how clients and monitoring decide what to do.
+- **Information leak.** Raw `error.message` from Postgres or Sequelize can contain table names, SQL fragments, file paths, or stack-trace bits. None of that should reach a client.
 
-- **Wrong status.** Unexpected errors in the outer catch are server bugs, not client mistakes. A 4xx tells the client "you did something wrong"; a 5xx tells them "the server broke". Status codes are how clients (and monitoring) decide what to do.
-- **Information leak.** Raw `error.message` from Postgres or Sequelize can contain table names, SQL fragments, file paths, or stack-trace artefacts. None of that should reach a client.
-
-The original gets this right by logging via `reportError` and returning an empty 500 body. The client just knows the server broke; the developer sees the full error in logs.
+The original gets this right — log via `reportError`, return an empty 500. The client knows the server broke; the developer sees the full error in logs.
 
 **Feedback**
 
-Always treat outer catches as the "unexpected error" branch — log server-side, return a generic 500. Per-row catches handle expected failures (validation, constraints) with detail and a 4xx. The two should be visibly different in code so the intent is obvious.
+Treat the outer catch as the "unexpected error" branch — log server-side, return a generic 500. The inner per-row catches handle _expected_ failures (validation, constraints) with detail and a 4xx. The two should look visibly different in code so the intent is obvious.
 
 ### 8. Sequence ID burning on preflight rollback
 
 **Analyse**
 
-Preflight runs the full pipeline — including `INSERT`s — then rolls back the transaction. The inserted rows are gone, but **the Postgres sequence used to allocate primary keys is non-transactional and does not roll back**. Every preflight call permanently consumes IDs.
+Preflight runs the full pipeline — including the `INSERT`s — then rolls back the transaction. The inserted rows are gone, but **the Postgres sequence that allocates primary keys is non-transactional and does not roll back**. Every preflight call permanently consumes IDs.
 
-Verified during testing: a preflight call returned `verified: [1, 2]`, and the following real save returned `created: [3, 4]` — the IDs 1 and 2 were consumed by the rolled-back preflight.
+I verified this in testing: a preflight call returned `verified: [1, 2]`, and the following real save returned `created: [3, 4]`. The IDs 1 and 2 were burned by the rolled-back preflight.
 
 **Problems**
 
-For active deployments where preflight is called frequently (e.g., a UI that previews on every form change), the gap between _student count_ and _highest student ID_ will grow unbounded. With a 4-byte INTEGER sequence the ceiling is ~2.1 billion — generally fine — but:
+If preflight is called frequently — e.g., a UI that previews on every form change — the gap between _student count_ and _highest student ID_ will grow without limit. With a 4-byte INTEGER sequence the ceiling is ~2.1 billion, which is generally fine, but:
 
-- IDs that appear in audit logs become harder to map to actual rows
-- Customers seeing "student #84,203" with only 80,000 students is confusing
-- For other tables in the same pattern that might use smaller integer types, exhaustion is a real risk
+- IDs in audit logs become harder to map to real rows.
+- Seeing "student #84,203" when there are only 80,000 students is confusing.
+- For tables using smaller integer types, exhaustion is a real risk.
 
-This is not a Postgres bug or a Sequelize bug — it's a deliberate trade-off in how sequences work (avoiding serialisation across concurrent transactions). But it's a real cost of using a rollback-based preflight rather than a pure-validation preflight.
+This isn't a bug in Postgres or Sequelize. Sequences are deliberately outside transactions, so they don't serialise across concurrent writers. It's a trade-off — and the cost lands on any rollback-based preflight.
 
 **Improvements**
 
-Two directions:
+Two options:
 
-1. **Pure-validation preflight.** Replace the "insert then rollback" pattern with the JS pre-validation pass already discussed in section 3 — `Student.build(data).validate()` and an existence check via `findAll` for unique constraints. No INSERTs at all in preflight, so no IDs consumed.
+1. **Pure-validation preflight.** Replace "insert then rollback" with the JavaScript pre-validation pass from section 3 — `Student.build(data).validate()` plus a `findAll` to check uniqueness. No INSERTs in preflight, so no IDs consumed.
 2. **Accept the cost.** For low-volume preflight traffic, sequence-burning is harmless. Document it and move on. `BIGSERIAL` instead of `SERIAL` makes the ceiling effectively unbounded.
 
 **Feedback**
 
-Worth flagging because it surprises people who assume rollback "undoes everything". It doesn't — sequences are intentionally outside transactional semantics. Whether to fix or accept depends on the realistic preflight call volume.
+Worth flagging because most people assume "rollback undoes everything." It doesn't — sequences sit outside transactional semantics on purpose. Whether to fix or accept depends on how often preflight gets called.
 
-### 9. `createdBy: req.user.id` relies on undeclared middleware
+### 9. `Array.from(req.body.entries()).length` smell
 
-The controller reads `req.user.id` without any check that `req.user` exists. This works because — presumably — auth middleware further up the stack populates `req.user`. But that dependency isn't visible from this file alone. If the route is ever wired up without the middleware (e.g. by accident in a refactor, or in a test setup), the handler crashes with `Cannot read properties of undefined`.
+The original computes the batch size with `Array.from(req.body.entries()).length`. This is the same as `req.body.length` — `.entries()` creates an iterator, `Array.from` turns it into an array, and `.length` reads its size. Three operations to get a value the array already has.
 
-Either a guard inside the handler (`if (!req.user?.id) { ... return 401 }`) or — better — an explicit middleware check baked into the route definition would make the dependency visible at the point of routing rather than buried in this file. Worth a comment near the line at minimum.
+The clue is later in the same file: `for (let [index, student] of req.body.entries())` actually needs `.entries()` to get both index and value. The `Array.from(...).length` line looks like a copy-paste from there. `req.body.length` is direct, reads cleanly.
 
-### 10. No migrations strategy visible
+### 10. "Create then throw" pattern for duplicates
 
-The codebase uses `sequelize.sync()` to create tables on startup. That works for development and demos, but `sync()` only creates tables that don't exist — it doesn't alter existing schemas. Once production data exists, every schema change (a new column, an index, a constraint) becomes a manual operation.
+When the in-batch duplicate check fires, the original still calls `Student.create(...)` for the duplicate row — and then deliberately throws a fake `Sequelize.ValidationError` to force the savepoint to roll back.
 
-For an Ada CS deployment, a proper migrations toolchain (Sequelize CLI, Umzug, or Knex) is necessary. Each schema change becomes a versioned, repeatable script. The current setup would force a careful manual migration on any production schema change, and creates the temptation to do destructive things in `sync({ force: true })` blocks. Worth raising even though it's out of scope for this file specifically.
+The author was trying to be clever: both kinds of duplicate error (in-batch and DB-unique) end up in the same catch block, in the same shape. One error path, easy to handle. But it has two real costs:
 
-### 11. `Array.from(req.body.entries()).length` smell
+- **A wasted INSERT round trip per duplicate.** We already know in JavaScript that the row is a duplicate, but we send it to Postgres anyway just so the catch block fires.
+- **Confusing control flow.** Reading it, you see `create` succeed, then a manual throw — and you have to stop and ask "why is it throwing right after a successful create?". Code that needs a comment to make sense is usually code worth simplifying.
 
-The original computes the batch size with `Array.from(req.body.entries()).length`. This is equivalent to `req.body.length` — the `.entries()` call creates an iterator, `Array.from` materialises it into an array, and `.length` reads its size. Three operations for a value that's already on the array.
+The fix is to detect duplicates up front in JavaScript (see section 2), and skip `create` entirely for those rows. No INSERT, no fake throw, no savepoint needed. Cleaner, faster, and the intent is obvious from the code.
 
-The clue to its origin is later in the same file: `for (let [index, student] of req.body.entries())` legitimately uses `.entries()` to get both index and value. The `Array.from(...).length` line looks like a copy-paste from there. `req.body.length` is direct, readable, and avoids allocating the intermediate array. Minor, but the kind of thing that catches a reviewer's eye.
+### 11. `req.user.id` relies on middleware that isn't visible from this file
 
-### 12. Inner "create then throw" pattern for duplicates
+The handler reads `req.user.id` without checking that `req.user` exists. I'm guessing there's auth middleware upstream that populates it — but that dependency isn't visible from this file alone. If the route is ever wired up without the middleware (a refactor, a test setup), the handler crashes with `Cannot read properties of undefined`.
 
-When the in-batch duplicate check fires, the original still calls `Student.create(...)` for the duplicate row, then deliberately throws `new Sequelize.ValidationError()` to force the savepoint rollback. This is clever — it ensures the dual error (in-batch dup + DB unique conflict) is caught uniformly — but it costs a wasted INSERT round trip per duplicate and makes the control flow harder to follow (the `if (duplicatedUsername)` block appears twice in the same iteration).
+A guard inside the handler — `if (!req.user?.id) { ... return 401 }` — or an explicit middleware requirement at the route definition would make the contract clearer. At a minimum, a comment near the line would help the next reader.
 
-A simpler approach is to detect duplicates in JS up front (see section 2), skip the create entirely for duplicate rows, and never engage the DB at all for that failure mode. Cleaner, faster, and removes the "create then throw" pattern that needs a comment to be understood.
+### 12. No migration strategy visible
+
+The codebase uses `sequelize.sync()` to create tables on startup. That works for development and demos, but `sync()` only creates tables that don't exist — it doesn't alter existing ones. Once production data exists, every schema change (a new column, an index, a constraint) becomes a manual operation.
+
+A proper migrations toolchain (Sequelize CLI, Umzug, or Knex) would make schema changes versioned and repeatable. Worth raising even though it's strictly outside this file — it's a deployment risk that gets harder to fix the longer it's left.

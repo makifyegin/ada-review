@@ -150,16 +150,12 @@ const createStudents = async (req, res, preflight = true) => {
         passwordResetRequired: true,
         createdBy: 1,
       }))
-
-      const created = await Student.bulkCreate(
-        records,
-        {
-          transaction,
-          validate: true,
-          returning: true,
-        },
-        { batchSize: 1000 },
-      )
+      // Mention chunk size
+      const created = await Student.bulkCreate(records, {
+        transaction,
+        validate: true,
+        returning: true,
+      })
       const createdIds = created.map((row) => row.id)
 
       if (preflight) {

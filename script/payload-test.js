@@ -11,7 +11,7 @@ const main = async () => {
   })
   const schoolData = await schoolRes.json()
   console.log(`School created:`, schoolData)
-  const schoolId = schoolData.created?.id ?? 1
+  const schoolId = 1
 
   // Generate 10,000 student objects
   const students = Array.from({ length: 10000 }, (_, i) => ({
